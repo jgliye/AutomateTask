@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "AutomateTask.Desktop": {
+      "commandName": "Project",
+      "commandLineArgs": "\"..\\AutomateTask\\bin\\$(Configuration)\\$(TargetFramework)\"",
+      "workingDirectory": "$(ProjectDir)"
+    }
+  }
+}

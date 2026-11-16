@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Version>1.0.0</Version>
+    <AssemblyTitle>自动化任务通知</AssemblyTitle>
+    <Product>自动化任务</Product>
+    <ApplicationIcon>..\AutomateTask\Assets\Logo.ico</ApplicationIcon>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Using Include="System.IO" />
+    <Resource Include="..\AutomateTask\Assets\Logo.ico" Link="Assets\Logo.ico" />
+    <Compile Include="..\AutomateTask\Models\TaskNotification.cs" Link="Models\TaskNotification.cs" />
+    <Compile Include="..\AutomateTask\Utils\NotificationProtocol.cs" Link="Utils\NotificationProtocol.cs" />
+    <Compile Include="..\AutomateTask\Utils\SerializeHelper.cs" Link="Utils\SerializeHelper.cs" />
+  </ItemGroup>
+</Project>
