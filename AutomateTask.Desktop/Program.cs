@@ -12,7 +12,7 @@ internal static class Program
     /// 默认使用发布包中 Tray 的上级目录，也可传入服务程序的绝对目录
     /// </summary>
     [STAThread]
-    private static void Main(string[] args)
+    private static int Main(string[] args)
     {
         var root = args.Length == 1 ? Path.GetFullPath(args[0])
             : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, ".."));
@@ -20,15 +20,17 @@ internal static class Program
         if (!File.Exists(Path.Combine(root, "appsettings.json")))
         {
             MessageBox.Show("请从发布包 Tray 目录启动，或传入服务程序所在目录", "自动化任务");
-            return;
+            return 1;
         }
 
         using var instance = new Mutex(true, @"Local\" + NotificationProtocol.PipeName(root), out var created);
 
         if (!created)
-            return;
+            return 0;
 
-        var application = new TrayApplication(root);
-        application.Run();
+        using var application = new TrayApplication(root);
+        var exitCode = application.Run();
+        application.Completion.GetAwaiter().GetResult();
+        return exitCode;
     }
 }

@@ -1,6 +1,8 @@
 using System.ComponentModel.DataAnnotations;
+using System.Threading.Channels;
 using AutomateTask.Enums;
 using AutomateTask.Models;
+using AutomateTask.Utils;
 
 namespace AutomateTask.Services;
 
@@ -10,31 +12,89 @@ namespace AutomateTask.Services;
 public sealed class AutomationWorker(ITaskService taskService, ILogger<AutomationWorker> log) : BackgroundService
 {
     private readonly DateTimeOffset boot = DateTimeOffset.Now;
+    private readonly Channel<byte> changes = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
+    {
+        SingleReader = true,
+        FullMode = BoundedChannelFullMode.DropWrite
+    });
 
     /// <summary>
-    /// 每项任务最多运行一轮，耗时 CRM 请求不阻塞其他通知计划
+    /// 等待最近计划或变更事件，每项任务最多运行一轮
     /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var running = new Dictionary<string, Task>();
+        var running = new Dictionary<string, Task<DateTimeOffset?>>();
+        var deferred = new Dictionary<string, DateTimeOffset>();
+        using var timer = new ScheduleTimer(Wake);
+        taskService.ConfigurationChanged += Wake;
+        taskService.CrmOperationCompleted += Wake;
         log.LogInformation("多任务服务启动；错过首轮时间不会补跑");
 
         try
         {
             while (!stoppingToken.IsCancellationRequested)
             {
+                // 合并本轮开始前的变更，读取快照期间发生的事件留到下一轮
+                while (changes.Reader.TryRead(out _))
+                {
+                }
+
                 foreach (var id in running.Where(item => item.Value.IsCompleted).Select(item => item.Key).ToArray())
                 {
+                    if (await running[id] is { } retryAt)
+                        deferred[id] = retryAt;
+                    else
+                        deferred.Remove(id);
+
                     running.Remove(id);
                 }
 
+                var now = DateTimeOffset.Now;
+                DateTimeOffset? next = null;
+
                 foreach (var task in taskService.Tasks)
                 {
-                    if (!running.ContainsKey(task.Id))
-                        running[task.Id] = RunTask(task, stoppingToken);
+                    if (running.ContainsKey(task.Id))
+                        continue;
+
+                    DateTimeOffset? due;
+
+                    try
+                    {
+                        due = NextRun(task, now);
+                    }
+                    catch (Exception ex)
+                    {
+                        ReportError(task, ex);
+                        continue;
+                    }
+
+                    if (due == null)
+                        continue;
+
+                    if (deferred.TryGetValue(task.Id, out var retry) && retry > due)
+                        due = retry;
+
+                    if (due > now)
+                    {
+                        if (next == null || due < next)
+                            next = due;
+
+                        continue;
+                    }
+
+                    // CRM 正忙时等待操作结束事件，不用零间隔重试占用会话
+                    if (task.Type == TaskType.WorkHours && !taskService.TryBeginCrmOperation(task.Id))
+                        continue;
+
+                    running[task.Id] = RunTask(task, stoppingToken);
+                    // 必须在 Task 已标记完成后唤醒，避免完成信号早于运行列表清理
+                    _ = running[task.Id].ContinueWith(_ => Wake(), CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+                timer.Set(next);
+                await changes.Reader.ReadAsync(stoppingToken);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -43,23 +103,67 @@ public sealed class AutomationWorker(ITaskService taskService, ILogger<Automatio
         }
         finally
         {
+            taskService.ConfigurationChanged -= Wake;
+            taskService.CrmOperationCompleted -= Wake;
             await Task.WhenAll(running.Values);
             log.LogInformation("多任务服务停止");
         }
     }
 
     /// <summary>
-    /// 隔离单个任务错误，实时错误只在变化时记录
+    /// 唤醒计划计算，密集发生的事件合并为一次通知
     /// </summary>
-    private async Task RunTask(TaskConfig task, CancellationToken ct)
+    private void Wake() => changes.Writer.TryWrite(0);
+
+    /// <summary>
+    /// 从最近执行状态及本机重复日期计算下一轮，不请求工作日日历
+    /// </summary>
+    private DateTimeOffset? NextRun(TaskConfig task, DateTimeOffset now)
+    {
+        task.Validate();
+        var config = task.Settings;
+        var date = DateOnly.FromDateTime(now.LocalDateTime);
+        var state = task.LastExecution;
+
+        // 系统日期回拨后等到最近执行日期，避免覆盖已有防重状态
+        if (state?.Date > date)
+            return config.Enabled || state is { Complete: false, PostAttempted: true }
+                ? TaskService.Due(state.Date, "00:00") : null;
+
+        if (state?.Date != date)
+            state = null;
+
+        if (state is { Complete: false })
+        {
+            if (!config.Enabled && !state.PostAttempted)
+                return now;
+
+            var retry = state.RetryAt ?? now;
+            var midnight = TaskService.Due(date.AddDays(1), "00:00");
+            return retry < midnight ? retry : midnight;
+        }
+
+        if (!config.Enabled)
+            return null;
+
+        var due = TaskService.Due(date, config.RunAt);
+        var selectedDay = config.RepeatMode == "Workdays" || config.WeekDays.Contains(TaskService.WeekDay(date));
+
+        if (state == null && selectedDay && due >= boot && due <= now)
+            return due;
+
+        return TaskService.Next(now, config, state?.Complete == true || due < boot);
+    }
+
+    /// <summary>
+    /// 隔离单个任务错误，准备失败按配置间隔等待，完成后重新计算计划
+    /// </summary>
+    private async Task<DateTimeOffset?> RunTask(TaskConfig task, CancellationToken ct)
     {
         try
         {
             if (task.Type == TaskType.WorkHours)
             {
-                if (!taskService.TryBeginCrmOperation(task.Id))
-                    return;
-
                 try
                 {
                     await TickWorkHours(task, ct);
@@ -78,11 +182,21 @@ public sealed class AutomationWorker(ITaskService taskService, ILogger<Automatio
         }
         catch (Exception ex)
         {
-            var error = "任务准备失败：" + WorkHoursService.GetErrorMessage(ex);
-
-            if (taskService.SetStatus(task.Id, error))
-                log.LogError("[任务:{TaskId}] {TaskName}：{Reason}", task.Id, task.Name, error);
+            ReportError(task, ex);
+            return DateTimeOffset.Now.AddSeconds(task.Settings.RetryIntervalSeconds);
         }
+        return null;
+    }
+
+    /// <summary>
+    /// 准备阶段异常只在提示内容变化时记录
+    /// </summary>
+    private void ReportError(TaskConfig task, Exception ex)
+    {
+        var error = "任务准备失败：" + WorkHoursService.GetErrorMessage(ex);
+
+        if (taskService.SetStatus(task.Id, error))
+            log.LogError("[任务:{TaskId}] {TaskName}：{Reason}", task.Id, task.Name, error);
     }
 
     /// <summary>
@@ -186,7 +300,7 @@ public sealed class AutomationWorker(ITaskService taskService, ILogger<Automatio
     }
 
     /// <summary>
-    /// 由后台循环按本机时间顺序检查计划或重试
+    /// 到达计划或重试时刻后按顺序执行工时核验与填报
     /// </summary>
     private async Task TickWorkHours(TaskConfig task, CancellationToken ct)
     {

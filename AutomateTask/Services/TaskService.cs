@@ -30,6 +30,27 @@ public sealed class TaskService(IBaseConfigService<TaskConfig> taskConfigService
     public IReadOnlyList<TaskConfig> Tasks => taskConfigService.GetList(BaseConfigType.ExecutionConfig);
 
     /// <summary>
+    /// 仅在启动或配置变化时判断是否需要运行桌面端
+    /// </summary>
+    public bool HasEnabledNotifications => Tasks.Any(task =>
+        task.Type == TaskType.Notification && task.Settings is NotificationConfig { Enabled: true });
+
+    /// <summary>
+    /// 任务配置已成功保存
+    /// </summary>
+    public event Action? ConfigurationChanged;
+
+    /// <summary>
+    /// CRM 操作已释放会话占用
+    /// </summary>
+    public event Action? CrmOperationCompleted;
+
+    /// <summary>
+    /// 执行状态已成功保存
+    /// </summary>
+    public event Action? NotificationChanged;
+
+    /// <summary>
     /// 按任务标识读取唯一配置记录
     /// </summary>
     public TaskConfig GetTask(string id)
@@ -84,6 +105,8 @@ public sealed class TaskService(IBaseConfigService<TaskConfig> taskConfigService
         {
             crmBusy.Remove(id);
         }
+
+        CrmOperationCompleted?.Invoke();
     }
 
     /// <summary>
@@ -217,6 +240,8 @@ public sealed class TaskService(IBaseConfigService<TaskConfig> taskConfigService
 
             log.LogInformation("[任务:{TaskId}] {TaskName}：配置已保存", id, request.Name.Trim());
         }
+
+        ConfigurationChanged?.Invoke();
     }
 
     /// <summary>
@@ -294,6 +319,8 @@ public sealed class TaskService(IBaseConfigService<TaskConfig> taskConfigService
                 pendingAccounts.Remove(account);
                 crmBusy.Remove(id);
             }
+
+            CrmOperationCompleted?.Invoke();
         }
     }
 
@@ -409,21 +436,37 @@ public sealed class TaskService(IBaseConfigService<TaskConfig> taskConfigService
             updated.Validate();
             return updated;
         }, BaseConfigType.ExecutionConfig);
+
+        NotificationChanged?.Invoke();
     }
 
     /// <summary>
-    /// 按触发时间返回当前用户尚未确认的当天通知
+    /// 判断桌面端运行需求，并按触发时间返回待处理通知
     /// </summary>
-    public TaskNotification? GetNotification(IReadOnlySet<string> receipts)
+    public NotificationStatus GetNotificationStatus(IReadOnlySet<string> receipts)
     {
+        var tasks = Tasks;
+        var status = new NotificationStatus
+        {
+            DesktopRequired = tasks.Any(task => task.Type == TaskType.Notification && task.Settings is NotificationConfig { Enabled: true })
+        };
+
+        if (!status.DesktopRequired)
+            return status;
+
         var date = DateOnly.FromDateTime(DateTime.Today);
         var pending = new List<TaskNotification>();
 
-        foreach (var task in Tasks)
+        foreach (var task in tasks)
         {
             try
             {
                 task.Validate();
+
+                // 停用通知任务后，不再投递其已生成的提醒
+                if (task.Type == TaskType.Notification && !task.Settings.Enabled)
+                    continue;
+
                 var state = task.LastExecution?.Date == date ? task.LastExecution : null;
                 TaskNotification? notification = state?.Notification;
 
@@ -456,7 +499,7 @@ public sealed class TaskService(IBaseConfigService<TaskConfig> taskConfigService
             }
         }
 
-        return pending.OrderBy(item => item.CreatedAt).FirstOrDefault();
+        return status with { Notification = pending.OrderBy(item => item.CreatedAt).FirstOrDefault() };
     }
 
     /// <summary>

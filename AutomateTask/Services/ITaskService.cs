@@ -13,6 +13,26 @@ public interface ITaskService
     IReadOnlyList<TaskConfig> Tasks { get; }
 
     /// <summary>
+    /// 是否存在已启用的定时通知任务
+    /// </summary>
+    bool HasEnabledNotifications { get; }
+
+    /// <summary>
+    /// 任务配置保存成功，需要重新判断桌面端运行需求
+    /// </summary>
+    event Action? ConfigurationChanged;
+
+    /// <summary>
+    /// CRM 操作已结束，可重新安排等待该会话的任务
+    /// </summary>
+    event Action? CrmOperationCompleted;
+
+    /// <summary>
+    /// 执行状态已保存，需要向已连接的桌面端推送通知
+    /// </summary>
+    event Action? NotificationChanged;
+
+    /// <summary>
     /// 获取任务列表及最近运行结果
     /// </summary>
     IReadOnlyList<TaskOverview> GetOverview();
@@ -93,9 +113,9 @@ public interface ITaskService
     void SaveState(string id, ExecutionState state);
 
     /// <summary>
-    /// 取得当前用户尚未确认的当天通知
+    /// 读取桌面端运行需求及当前用户尚未确认的当天通知
     /// </summary>
-    TaskNotification? GetNotification(IReadOnlySet<string> receipts);
+    NotificationStatus GetNotificationStatus(IReadOnlySet<string> receipts);
 
     /// <summary>
     /// 记录托盘已接收提醒，不修改工时记录

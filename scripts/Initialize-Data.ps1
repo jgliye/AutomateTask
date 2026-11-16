@@ -49,7 +49,7 @@ $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($admin
 $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system,'FullControl',$allow))
 $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($service,'ReadAndExecute',$allow))
 $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($users,'ReadAndExecute',$allow))
-foreach ($name in @('appsettings.json','appsettings.Production.json','Open-Management.ps1','打开管理页面.cmd')) {
+foreach ($name in @('appsettings.json','appsettings.Production.json','Open-Management.ps1','Start-Desktop.ps1','打开管理页面.cmd')) {
     Set-Acl -LiteralPath (Join-Path $Root $name) -AclObject $fileAcl
 }
 Write-Host '服务数据目录已准备；没有启动服务'

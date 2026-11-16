@@ -17,17 +17,22 @@ namespace AutomateTask.Desktop;
 /// <summary>
 /// 在用户会话中显示 WPF 托盘菜单并接收后台通知
 /// </summary>
-internal sealed class TrayApplication : Application
+internal sealed class TrayApplication : Application, IDisposable
 {
     private readonly string root;
     private readonly string receiptPath;
     private readonly NotifyIcon icon;
     private readonly ContextMenu menu = new();
-    private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(10) };
     private readonly CancellationTokenSource stopping = new();
     private readonly HashSet<string> receipts = [];
     private DateOnly receiptDate = DateOnly.FromDateTime(DateTime.Today);
-    private bool fetching;
+    private Task? listening;
+    private bool disposed;
+
+    /// <summary>
+    /// 退出前等待通知连接结束
+    /// </summary>
+    public Task Completion => listening ?? Task.CompletedTask;
 
     /// <summary>
     /// 加载托盘资源与本用户当天回执，不访问业务数据库
@@ -46,15 +51,14 @@ internal sealed class TrayApplication : Application
             ContextMenu = menu
         };
 
-        var openItem = new MenuItem { Header = "打开管理页面" };
+        var openItem = new MenuItem { Header = "管理页面" };
         openItem.Click += OpenManagement;
-        var exitItem = new MenuItem { Header = "退出提醒（后台任务继续）" };
+        var exitItem = new MenuItem { Header = "退出提醒" };
         exitItem.Click += (_, _) => Shutdown();
         menu.Items.Add(openItem);
         menu.Items.Add(new Separator());
         menu.Items.Add(exitItem);
         icon.DoubleClick += OpenManagement;
-        timer.Tick += Poll;
 
         try
         {
@@ -77,115 +81,163 @@ internal sealed class TrayApplication : Application
     }
 
     /// <summary>
-    /// 启动托盘与十秒轮询，不要求主程序已连接
+    /// 建立通知连接，无启用的通知任务时由首次状态决定退出
     /// </summary>
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
-        icon.Show();
-        timer.Start();
+        listening = Task.Run(ListenAsync);
     }
 
     /// <summary>
-    /// 有界读取当天通知，系统通知提交成功并记录回执后再确认接收
+    /// 持续等待管道推送，退出或服务断开后结束连接
     /// </summary>
-    private async void Poll(object? sender, EventArgs e)
+    private async Task ListenAsync()
     {
-        if (fetching || stopping.IsCancellationRequested)
-            return;
-
-        fetching = true;
-
         try
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(stopping.Token);
-            deadline.CancelAfter(TimeSpan.FromSeconds(3));
-            // 只申请数据读写权限，避免额外要求创建管道实例的权限
             using var pipe = new NamedPipeClientStream(".", NotificationProtocol.PipeName(root),
                 PipeAccessRights.ReadWrite, PipeOptions.Asynchronous,
                 TokenImpersonationLevel.Anonymous, HandleInheritability.None);
-            await pipe.ConnectAsync(deadline.Token);
-            var today = DateOnly.FromDateTime(DateTime.Today);
-
-            if (receiptDate != today)
+            using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(stopping.Token))
             {
-                receiptDate = today;
-                receipts.Clear();
+                deadline.CancelAfter(TimeSpan.FromSeconds(15));
+                await pipe.ConnectAsync(deadline.Token).ConfigureAwait(false);
+                await NotificationProtocol.Write(pipe, receipts, deadline.Token).ConfigureAwait(false);
             }
 
-            await NotificationProtocol.Write(pipe, receipts, deadline.Token);
-            var notification = await NotificationProtocol.Read<TaskNotification>(pipe, deadline.Token);
-
-            if (stopping.IsCancellationRequested)
-                return;
-
-            icon.ToolTipText = "自动化任务：已连接服务";
-
-            if (notification == null)
+            while (!stopping.IsCancellationRequested)
             {
-                await pipe.WriteAsync(new byte[] { 1 }, deadline.Token);
-                return;
+                // 空闲读取只受退出取消控制，不使用状态轮询或空闲超时
+                var status = await NotificationProtocol.Read<NotificationStatus>(pipe, stopping.Token).ConfigureAwait(false)
+                    ?? throw new InvalidDataException("通知状态为空");
+                var keepRunning = await Dispatcher.InvokeAsync(() => ApplyStatus(status),
+                    DispatcherPriority.Normal, stopping.Token).Task.ConfigureAwait(false);
+
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(stopping.Token);
+                deadline.CancelAfter(TimeSpan.FromSeconds(3));
+                await pipe.WriteAsync(new byte[] { 1 }, deadline.Token).ConfigureAwait(false);
+
+                if (!keepRunning)
+                {
+                    await Dispatcher.InvokeAsync(() => Shutdown(),
+                        DispatcherPriority.Normal, stopping.Token).Task.ConfigureAwait(false);
+                    return;
+                }
             }
-
-            if (notification.Date != today || string.IsNullOrWhiteSpace(notification.Id) || notification.Id.Length > 150 ||
-                string.IsNullOrWhiteSpace(notification.Title) || notification.Title.Length > 60 ||
-                string.IsNullOrWhiteSpace(notification.Message) || notification.Message.Length > 200)
-                throw new InvalidDataException("仅接受当天有效通知");
-
-            if (!receipts.Contains(notification.Id))
-            {
-                icon.ShowBalloonTip(notification.Title, notification.Message, notification.Success);
-                receipts.Add(notification.Id);
-                Directory.CreateDirectory(Path.GetDirectoryName(receiptPath)!);
-                var temp = receiptPath + ".tmp";
-                File.WriteAllLines(temp, [today.ToString("yyyy-MM-dd"), .. receipts], new UTF8Encoding(false));
-                File.Move(temp, receiptPath, true);
-            }
-
-            // 写入本用户回执后才确认，保持与后台现有协议一致
-            await pipe.WriteAsync(new byte[] { 1 }, deadline.Token);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException or JsonException or Win32Exception)
+        catch (OperationCanceledException) when (stopping.IsCancellationRequested)
         {
-            if (!stopping.IsCancellationRequested)
-                icon.ToolTipText = "自动化任务：等待服务或通知通道恢复";
+            // 用户退出时取消挂起的连接与读取
         }
-        finally
+        catch (Exception ex)
         {
-            fetching = false;
+            Trace.TraceError("桌面通知连接失败：{0}", ex);
+
+            try
+            {
+                await Dispatcher.InvokeAsync(() => Shutdown(1)).Task.ConfigureAwait(false);
+            }
+            catch (TaskCanceledException) when (Dispatcher.HasShutdownStarted)
+            {
+                // 应用已退出，无需再次请求关闭
+            }
         }
     }
 
     /// <summary>
-    /// 由用户点击菜单或双击图标后打开管理页面
+    /// 在界面线程处理通知，返回是否仍需要运行桌面端
+    /// </summary>
+    private bool ApplyStatus(NotificationStatus status)
+    {
+        if (!status.DesktopRequired)
+        {
+            menu.IsOpen = false;
+            icon.Hide();
+            return false;
+        }
+
+        icon.ToolTipText = "自动化任务：已连接服务";
+
+        if (!icon.IsIconVisible)
+            icon.Show();
+
+        var today = DateOnly.FromDateTime(DateTime.Today);
+
+        if (receiptDate != today)
+        {
+            receiptDate = today;
+            receipts.Clear();
+        }
+
+        var notification = status.Notification;
+
+        if (notification == null)
+            return true;
+
+        if (notification.Date != today || string.IsNullOrWhiteSpace(notification.Id) || notification.Id.Length > 150 ||
+            string.IsNullOrWhiteSpace(notification.Title) || notification.Title.Length > 60 ||
+            string.IsNullOrWhiteSpace(notification.Message) || notification.Message.Length > 200)
+            throw new InvalidDataException("仅接受当天有效通知");
+
+        if (!receipts.Contains(notification.Id))
+        {
+            icon.ShowBalloonTip(notification.Title, notification.Message, notification.Success);
+            receipts.Add(notification.Id);
+            Directory.CreateDirectory(Path.GetDirectoryName(receiptPath)!);
+            var temp = receiptPath + ".tmp";
+            File.WriteAllLines(temp, [today.ToString("yyyy-MM-dd"), .. receipts], new UTF8Encoding(false));
+            File.Move(temp, receiptPath, true);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 读取服务地址，通过默认浏览器打开管理页面
     /// </summary>
     private void OpenManagement(object? sender, RoutedEventArgs e)
     {
         try
         {
-            Process.Start(new ProcessStartInfo("powershell.exe")
-            {
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{Path.Combine(root, "Open-Management.ps1")}\"",
-                UseShellExecute = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            });
+            var configuration = SerializeHelper.Load<Dictionary<string, JsonElement>>(
+                Path.Combine(root, "appsettings.Production.json"));
+            var address = configuration.TryGetValue("Urls", out var value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString() : null;
+
+            if (!Uri.TryCreate(address, UriKind.Absolute, out var url) || url.Scheme != Uri.UriSchemeHttp || url.Host != "127.0.0.1")
+                throw new InvalidDataException("请在 appsettings.Production.json 中配置有效的本机服务地址");
+
+            Process.Start(new ProcessStartInfo(url.AbsoluteUri) { UseShellExecute = true });
         }
-        catch (Win32Exception)
+        catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException or JsonException)
         {
-            icon.ShowBalloonTip("自动化任务", "管理页面未打开，请检查服务目录和打开页面脚本", false);
+            var message = "管理页面未打开：" + ex.Message;
+            icon.ShowBalloonTip("自动化任务", message.Length > 200 ? message[..200] : message, false);
         }
     }
 
     /// <summary>
-    /// 退出时关闭菜单并释放托盘和轮询资源，后台服务继续运行
+    /// 退出提醒时取消连接并隐藏图标，后台任务继续运行
     /// </summary>
     protected override void OnExit(ExitEventArgs e)
     {
-        timer.Stop();
         stopping.Cancel();
         menu.IsOpen = false;
         icon.Dispose();
-        stopping.Dispose();
         base.OnExit(e);
+    }
+
+    /// <summary>
+    /// 通知连接结束后在主线程释放托盘资源
+    /// </summary>
+    public void Dispose()
+    {
+        if (disposed)
+            return;
+
+        disposed = true;
+        icon.Dispose();
+        stopping.Dispose();
     }
 }

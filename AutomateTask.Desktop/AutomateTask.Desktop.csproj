@@ -15,6 +15,7 @@
     <Using Include="System.IO" />
     <Resource Include="..\AutomateTask\Assets\Logo.ico" Link="Assets\Logo.ico" />
     <Compile Include="..\AutomateTask\Models\TaskNotification.cs" Link="Models\TaskNotification.cs" />
+    <Compile Include="..\AutomateTask\Models\NotificationStatus.cs" Link="Models\NotificationStatus.cs" />
     <Compile Include="..\AutomateTask\Utils\NotificationProtocol.cs" Link="Utils\NotificationProtocol.cs" />
     <Compile Include="..\AutomateTask\Utils\SerializeHelper.cs" Link="Utils\SerializeHelper.cs" />
   </ItemGroup>

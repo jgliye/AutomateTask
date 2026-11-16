@@ -19,7 +19,7 @@ if ($LASTEXITCODE -ne 0) { throw '发布失败' }
 $trayProject = Join-Path $root 'AutomateTask.Desktop\AutomateTask.Desktop.csproj'
 & dotnet publish $trayProject -c Release -r win-x64 --self-contained true "-p:Version=$version" -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o (Join-Path $output 'Tray')
 if ($LASTEXITCODE -ne 0) { throw '托盘发布失败' }
-foreach ($name in @('Install-Service.ps1','Uninstall-Service.ps1','Initialize-Data.ps1','Open-Management.ps1','安装服务.cmd','卸载服务.cmd','打开管理页面.cmd')) {
+foreach ($name in @('Install-Service.ps1','Uninstall-Service.ps1','Initialize-Data.ps1','Open-Management.ps1','Start-Desktop.ps1','安装服务.cmd','卸载服务.cmd','打开管理页面.cmd')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $output
 }
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $output
